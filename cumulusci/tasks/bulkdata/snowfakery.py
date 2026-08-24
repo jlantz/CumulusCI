@@ -155,12 +155,17 @@ class Snowfakery(BaseSalesforceApiTask):
     def _validate_options(self):
         "Validate options before executing the task or before freezing it"
         super()._validate_options()
-        # Do not store recipe due to MetaDeploy options freezing
-        recipe = self.options.get("recipe")
-        recipe = Path(recipe)
-        if not recipe.exists():
-            raise exc.TaskOptionsError(f"Cannot find recipe `{recipe}`")
-
+        # The recipe's existence is deliberately NOT checked here. This method
+        # runs from BaseTask.__init__, which is before __call__ enters
+        # `cd(self.project_config.repo_root)`, so a relative recipe would be
+        # resolved against the caller's working directory. In a cross-project
+        # flow (`sources:`) that is a different project entirely, and the check
+        # rejected a recipe that was present in its own project all along. The
+        # check now lives in setup(), which runs inside that cd. Same move as
+        # #2523, which relocated load_custom_settings' settings_path check.
+        #
+        # Note also: the recipe is deliberately not stored on self here, due to
+        # MetaDeploy options freezing.
         self.num_generator_workers = self.options.get("num_processes", None)
         if self.num_generator_workers is not None:
             self.num_generator_workers = int(self.num_generator_workers)
@@ -249,6 +254,12 @@ class Snowfakery(BaseSalesforceApiTask):
         self.run_until = determine_run_until(self.options, self.sf)
         self.start_time = time.time()
         self.recipe = Path(self.options.get("recipe"))
+        # Checked here rather than in _validate_options because this runs
+        # inside BaseTask.__call__'s cd(repo_root), so a relative recipe
+        # resolves against this task's OWN project -- which is what makes the
+        # task usable from a cross-project flow. See _validate_options.
+        if not self.recipe.exists():
+            raise exc.TaskOptionsError(f"Cannot find recipe `{self.recipe}`")
         self.sobject_counts = defaultdict(RunningTotals)
         self._init_channel_configs(self.recipe)
 

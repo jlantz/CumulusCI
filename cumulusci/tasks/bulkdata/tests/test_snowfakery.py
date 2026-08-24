@@ -23,6 +23,7 @@ from cumulusci.tasks.bulkdata.tests.integration_test_utils import ensure_account
 from cumulusci.tasks.bulkdata.tests.utils import _make_task
 from cumulusci.tasks.salesforce.BaseSalesforceApiTask import BaseSalesforceApiTask
 from cumulusci.tests.util import DummyKeychain, DummyOrgConfig
+from cumulusci.utils import cd
 from cumulusci.utils.parallel.task_worker_queues.tests.test_parallel_worker import (
     DelaySpawner,
 )
@@ -1430,3 +1431,57 @@ class TestSnowfakery:
     #         self._run_snowfakery_and_inspect_mapping(
     #             generator_yaml=simple_snowfakery_yaml, loading_rules=str(loading_rules)
     #         )
+
+
+class TestRecipePathResolution:
+    """The recipe option must resolve against the task's OWN project, not the
+    caller's working directory.
+
+    BaseTask.__call__ runs the task body inside `cd(project_config.repo_root)`,
+    but _init_options/_validate_options run earlier, from __init__. Checking the
+    recipe's existence at validate time therefore resolved it against whatever
+    directory the user happened to be in -- which for a cross-project flow
+    (`sources:`) is a different project entirely, so a recipe that was present
+    all along was reported missing. Same class of bug, and same fix, as #2523
+    for load_custom_settings' settings_path.
+    """
+
+    def test_missing_recipe_is_not_rejected_at_construction(self):
+        """Constructing the task must not touch the filesystem for the recipe."""
+        task = _make_task(
+            Snowfakery, {"options": {"recipe": "datasets/dev.recipe.yml"}}
+        )
+        assert task.options["recipe"] == "datasets/dev.recipe.yml"
+
+    def test_missing_recipe_still_raises_when_the_task_runs(self):
+        """The check is relocated, not removed."""
+        task = _make_task(
+            Snowfakery, {"options": {"recipe": "datasets/does-not-exist.recipe.yml"}}
+        )
+        task.sf = mock.Mock()
+        with pytest.raises(exc.TaskOptionsError, match="Cannot find recipe"):
+            task.setup()
+
+    def test_recipe_relative_to_the_tasks_own_project_resolves(self):
+        """The regression this guards: cwd is some other project, and the recipe
+        exists only under this task's repo_root. Mirrors a cross-project step,
+        whose project_config.repo_root is the fetched source checkout."""
+        with TemporaryDirectory() as source_project, TemporaryDirectory() as caller_cwd:
+            recipe_dir = Path(source_project) / "datasets"
+            recipe_dir.mkdir()
+            recipe = recipe_dir / "dev.recipe.yml"
+            recipe.write_text(simple_salesforce_yaml.read_text())
+
+            task = _make_task(
+                Snowfakery, {"options": {"recipe": "datasets/dev.recipe.yml"}}
+            )
+            task.sf = mock.Mock()
+
+            # What BaseTask.__call__ does for real: run the body from the
+            # task's own repo_root while the process sits somewhere else.
+            with cd(caller_cwd):
+                assert not (Path(caller_cwd) / "datasets/dev.recipe.yml").exists()
+                with cd(source_project):
+                    task.setup()
+
+            assert task.recipe == Path("datasets/dev.recipe.yml")
