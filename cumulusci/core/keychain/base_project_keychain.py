@@ -1,3 +1,5 @@
+from typing import Optional
+
 import sarge
 
 from cumulusci.core.config import ConnectedAppOAuthConfig, ServiceConfig
@@ -55,12 +57,24 @@ class BaseProjectKeychain(BaseConfig):
     #######################################
 
     def create_scratch_org(
-        self, org_name, config_name, days=None, set_password=True, release=None
+        self,
+        org_name: str,
+        config_name: str,
+        days: Optional[int] = None,
+        set_password: Optional[bool] = None,
+        release: Optional[str] = None,
     ):
-        """Adds/Updates a scratch org config to the keychain from a named config"""
+        """Adds/Updates a scratch org config to the keychain from a named config
+
+        set_password: whether to generate a password when the org is created.
+        An explicit value wins; None uses the `set_password` key of the named
+        scratch config in `orgs__scratch`, which defaults to True."""
         scratch_config = self.project_config.lookup(f"orgs__scratch__{config_name}")
         if scratch_config is None:
             raise OrgNotFound(f"No such org configured: `{config_name}`")
+        # Work on a copy so this org's settings don't leak back into the
+        # project's scratch config, which later orgs are created from.
+        scratch_config = dict(scratch_config)
         if days is not None:
             # Allow override of scratch config's default days
             scratch_config["days"] = days
@@ -69,6 +83,8 @@ class BaseProjectKeychain(BaseConfig):
             scratch_config.setdefault("days", 1)
         if release is not None:
             scratch_config["release"] = release
+        if set_password is None:
+            set_password = scratch_config.get("set_password", True)
         scratch_config["set_password"] = bool(set_password)
         scratch_config["scratch"] = True
         scratch_config.setdefault("namespaced", False)

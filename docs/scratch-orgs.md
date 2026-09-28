@@ -224,6 +224,29 @@ a different org shape and a different use case. The key facets of the
 org shape that are defined in the `cumulusci.yml` file are whether or
 not the org has a namespace, and the length of the org's lifespan.
 
+By default, CumulusCI generates a password for the admin user of each
+scratch org it creates. To skip that for an org configuration, such as
+one used only in CI, set `set_password: False`:
+
+```yaml
+orgs:
+    scratch:
+        ci:
+            config_file: orgs/dev.json
+            set_password: False
+```
+
+This applies to every org created from the configuration, including the
+predefined orgs CumulusCI registers automatically and orgs created with
+`cci org scratch`. Pass `cci org scratch --no-password` to skip the
+password for a single org whatever the configuration says.
+
+An org already in the CumulusCI keychain keeps the setting it was
+registered with, including when CumulusCI recreates it after it
+expires. To pick up a changed `set_password`, remove the org with
+`cci org remove <org_name>`; a predefined org is registered again, from
+the current configuration, the next time CumulusCI runs.
+
 Org definition files stored in the `orgs` directory are configured as
 specified in the [Salesforce DX Developer
 Guide](https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_scratch-orgs_def_file.htm).

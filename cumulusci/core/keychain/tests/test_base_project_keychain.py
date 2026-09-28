@@ -157,6 +157,57 @@ class TestBaseProjectKeychain:
         assert org_config["days"] == 3
         assert org_config["release"] == "previous"
 
+    @pytest.mark.parametrize(
+        "config_value,arg,expected",
+        [
+            # No argument: the scratch config's value, else the default of True
+            (None, None, True),
+            (True, None, True),
+            (False, None, False),
+            # An explicit argument wins over the scratch config
+            (True, False, False),
+            (False, True, True),
+            (None, False, False),
+        ],
+    )
+    def test_create_scratch_org__set_password_precedence(
+        self, config_value, arg, expected
+    ):
+        dev = {} if config_value is None else {"set_password": config_value}
+        project_config = BaseProjectConfig(
+            UniversalConfig, {"orgs": {"scratch": {"dev": dev}}}
+        )
+        keychain = BaseProjectKeychain(project_config, None)
+
+        keychain.create_scratch_org("test", "dev", set_password=arg)
+
+        assert keychain.get_org("test").config["set_password"] is expected
+        # The project's scratch config is left as it was
+        assert project_config.orgs__scratch["dev"] == dev
+
+    @pytest.mark.parametrize("config_value,expected", [(None, True), (False, False)])
+    def test_load_scratch_orgs__honours_set_password(self, config_value, expected):
+        dev = {} if config_value is None else {"set_password": config_value}
+        project_config = BaseProjectConfig(
+            UniversalConfig, {"orgs": {"scratch": {"dev": dev}}}
+        )
+
+        keychain = BaseProjectKeychain(project_config, None)
+
+        assert keychain.get_org("dev").config["set_password"] is expected
+
+    def test_create_scratch_org__explicit_arg_does_not_leak(self):
+        project_config = BaseProjectConfig(
+            UniversalConfig, {"orgs": {"scratch": {"dev": {"set_password": True}}}}
+        )
+        keychain = BaseProjectKeychain(project_config, None)
+
+        keychain.create_scratch_org("nopw", "dev", set_password=False)
+        keychain.create_scratch_org("other", "dev")
+
+        assert keychain.get_org("nopw").config["set_password"] is False
+        assert keychain.get_org("other").config["set_password"] is True
+
     def test_load_scratch_orgs(self, keychain):
         assert list(keychain.orgs) == []
 

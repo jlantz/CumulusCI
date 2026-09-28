@@ -590,8 +590,13 @@ def org_scratch(
     if devhub:
         scratch_config["devhub"] = devhub
 
+    # Only an explicit --no-password overrides the scratch config's set_password.
     runtime.keychain.create_scratch_org(
-        org_name, config_name, days, set_password=not (no_password), release=release
+        org_name,
+        config_name,
+        days,
+        set_password=False if no_password else None,
+        release=release,
     )
 
     if default:

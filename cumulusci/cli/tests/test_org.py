@@ -888,9 +888,9 @@ class TestOrgCommands:
 
         run_click_command(org.org_list, runtime=runtime, json_flag=False, plain=False)
 
-        assert "Cannot load org config for `test1`" in str(echo.mock_calls), (
+        assert "Cannot load org config for `test1`" in str(
             echo.mock_calls
-        )
+        ), echo.mock_calls
         assert "NOPE!" in str(echo.mock_calls), echo.mock_calls
         assert "Cannot cleanup org cache dirs" in str(echo.mock_calls), echo.mock_calls
 
@@ -1311,6 +1311,28 @@ class TestOrgCommands:
         runtime.check_org_overwrite.assert_called_once()
         runtime.keychain.create_scratch_org.assert_called_with(
             "test", "dev", 7, set_password=False, release=None
+        )
+
+    def test_org_scratch__password_from_scratch_config(self):
+        """Without --no-password, the scratch config's set_password decides."""
+        runtime = mock.Mock()
+        runtime.project_config.lookup = MockLookup(
+            orgs__scratch={"dev": {"orgName": "Dev"}}
+        )
+        run_click_command(
+            org.org_scratch,
+            runtime=runtime,
+            config_name="dev",
+            org_name="test",
+            default=False,
+            devhub=None,
+            days=None,
+            no_password=False,
+            release=None,
+        )
+
+        runtime.keychain.create_scratch_org.assert_called_with(
+            "test", "dev", None, set_password=None, release=None
         )
 
     def test_org_scratch_no_configs(self):
