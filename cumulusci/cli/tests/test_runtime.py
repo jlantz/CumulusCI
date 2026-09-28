@@ -122,6 +122,55 @@ class TestCliRuntime:
         config.check_org_expired("test", org_config)
         config.keychain.create_scratch_org.assert_called_once()
 
+    def test_get_org__check_expired_false_leaves_expired_org_alone(self):
+        config = CliRuntime()
+        config.keychain = mock.Mock()
+        config.keychain.get_org.return_value = org_config = OrgConfig(
+            {
+                "scratch": True,
+                "date_created": date.today() - timedelta(days=2),
+                "expired": True,
+            },
+            "test",
+        )
+
+        org_name, result = config.get_org("test", check_expired=False)
+
+        assert result is org_config
+        config.keychain.create_scratch_org.assert_not_called()
+
+    def test_get_org__missing_default_without_failing(self):
+        config = CliRuntime()
+        config.keychain = mock.Mock()
+        config.keychain.get_default_org.return_value = (None, None)
+
+        assert config.get_org(fail_if_missing=False, check_expired=False) == (
+            None,
+            None,
+        )
+
+    @pytest.mark.parametrize("set_password", [True, False, None])
+    def test_check_org_expired__passes_stored_set_password(self, set_password):
+        config = CliRuntime()
+        config.keychain = mock.Mock()
+        org_config = OrgConfig(
+            {
+                "scratch": True,
+                "date_created": date.today() - timedelta(days=2),
+                "expired": True,
+                "config_name": "dev",
+                "days": 3,
+                "set_password": set_password,
+            },
+            "test",
+        )
+
+        config.check_org_expired("test", org_config)
+
+        config.keychain.create_scratch_org.assert_called_once_with(
+            "test", "dev", days=3, set_password=set_password
+        )
+
     def test_check_org_overwrite_not_found(self):
         config = CliRuntime()
         config.keychain.get_org = mock.Mock(side_effect=OrgNotFound)

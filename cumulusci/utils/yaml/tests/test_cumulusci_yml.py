@@ -173,6 +173,17 @@ class TestCumulusciYml:
         assert not caplog.text, caplog.text
         assert out == {}
 
+    def test_scratch_org_set_password(self, caplog):
+        yaml = """orgs:
+                    scratch:
+                        dev:
+                            config_file: orgs/dev.json
+                            set_password: False
+"""
+        cciyml = cci_safe_load(StringIO(yaml))
+        assert not caplog.text, caplog.text
+        assert cciyml["orgs"]["scratch"]["dev"]["set_password"] is False
+
     def test_custom(self, caplog):
         yaml = """project:
                     custom:

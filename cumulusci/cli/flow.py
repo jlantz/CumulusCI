@@ -144,10 +144,17 @@ def flow_info(runtime, flow_name):
 @pass_runtime(require_keychain=True)
 def flow_run(runtime, flow_name, org, delete_org, debug, o, no_prompt):
 
-    # Get necessary configs
-    org, org_config = runtime.get_org(org)
-    if delete_org and not org_config.scratch:
-        raise click.UsageError("--delete-org can only be used with a scratch org")
+    # Look the org up without failing or recreating it yet: a flow in which no
+    # step needs an org runs without one, and never creates or refreshes it.
+    # Whether this flow needs an org is decided below, once its steps are known.
+    _, org_config = runtime.get_org(org, fail_if_missing=False, check_expired=False)
+    if delete_org:
+        if org_config is None:
+            raise click.UsageError(
+                "--delete-org requires a scratch org, but no org was specified and no default org is set."
+            )
+        if not org_config.scratch:
+            raise click.UsageError("--delete-org can only be used with a scratch org")
 
     # Parse command line options
     options = defaultdict(dict)
@@ -164,6 +171,10 @@ def flow_run(runtime, flow_name, org, delete_org, debug, o, no_prompt):
     # Create the flow and handle initialization exceptions
     try:
         coordinator = runtime.get_flow(flow_name, options=options)
+        if coordinator.requires_org:
+            # Resolve the org for real: fail if there is none, as before, and
+            # recreate it if it is an expired scratch org.
+            _, org_config = runtime.get_org(org)
         start_time = datetime.now()
         coordinator.run(org_config)
         duration = datetime.now() - start_time

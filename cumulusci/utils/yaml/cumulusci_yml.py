@@ -151,6 +151,7 @@ class ScratchOrg(CCIDictModel):
     setup_flow: str = None
     noancestors: bool = None
     release: Literal["preview", "previous"] = None
+    set_password: bool = None
 
 
 class Orgs(CCIDictModel):

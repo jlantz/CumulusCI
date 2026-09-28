@@ -1313,6 +1313,28 @@ class TestOrgCommands:
             "test", "dev", 7, set_password=False, release=None
         )
 
+    def test_org_scratch__password_from_scratch_config(self):
+        """Without --no-password, the scratch config's set_password decides."""
+        runtime = mock.Mock()
+        runtime.project_config.lookup = MockLookup(
+            orgs__scratch={"dev": {"orgName": "Dev"}}
+        )
+        run_click_command(
+            org.org_scratch,
+            runtime=runtime,
+            config_name="dev",
+            org_name="test",
+            default=False,
+            devhub=None,
+            days=None,
+            no_password=False,
+            release=None,
+        )
+
+        runtime.keychain.create_scratch_org.assert_called_with(
+            "test", "dev", None, set_password=None, release=None
+        )
+
     def test_org_scratch_no_configs(self):
         runtime = mock.Mock()
         runtime.project_config.lookup = MockLookup(orgs__scratch=None)

@@ -435,6 +435,10 @@
                     "title": "Release",
                     "enum": ["preview", "previous"],
                     "type": "string"
+                },
+                "set_password": {
+                    "title": "Set Password",
+                    "type": "boolean"
                 }
             },
             "additionalProperties": false

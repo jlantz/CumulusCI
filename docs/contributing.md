@@ -56,30 +56,38 @@ development.
 
 2.  Clone your fork to your local workspace.
 
-3.  Create a fresh Python 3 virtual environment and activate it (to keep
-    this isolated from other Python software on your machine). Here is
-    one way:
+3.  Install [uv](https://docs.astral.sh/uv/), which CumulusCI uses to
+    manage its virtual environment and dependencies. If you don't already
+    have it:
 
-        $ python3 -m venv cci_venv
-        $ source cci_venv/bin/activate
+        $ curl -LsSf https://astral.sh/uv/install.sh | sh
 
-4.  Install the development requirements:
+    (`brew install uv` and `pip install uv` also work.)
 
-        $ make dev-install
+4.  From the repository root, create the environment and install
+    CumulusCI with all of its dependencies. `uv sync` provisions a
+    compatible Python (CumulusCI requires Python 3.11–3.13), creates a
+    `.venv`, and installs CumulusCI in editable mode. `--all-groups`
+    pulls in the `dev` and `lint` dependencies you'll need below:
 
-5.  Install `pre-commit` hooks for `black` and `flake8`:
+        $ uv sync --all-groups
 
-        $ pre-commit install --install-hooks
+5.  Install `pre-commit` hooks for `black`, `flake8`, and `isort`:
 
-6.  After making changes, run the tests and make sure they all pass:
+        $ uv run pre-commit install --install-hooks
 
-        $ pytest
+6.  After making changes, run the tests and make sure they all pass.
+    Prefixing a command with `uv run` executes it inside the project
+    environment (alternatively, activate it once with
+    `source .venv/bin/activate` and drop the prefix):
+
+        $ uv run pytest
 
 7.  Your new code should also have meaningful tests. One way to double
     check that your tests cover everything is to ensure that your new
     code has test code coverage:
 
-        $ make coverage
+        $ uv run make coverage
 
 8.  Push your changes to GitHub and submit a Pull Request. The base
     branch should be a new feature branch that we create to receive the
@@ -111,6 +119,14 @@ Before you submit a pull request, check that it meets these guidelines:
     -   `ignore-for-release` for internal changes.
 
 ## Testing CumulusCI
+
+```{note}
+Some tests assume the system clock is set to UTC and will fail in other
+time zones, because they derive values such as scratch-org age from
+`datetime.utcnow()`. If tests like `test_days_alive`, `test_format_days`,
+or `test_org_list` fail with off-by-one date differences, prefix your
+command with `TZ=UTC`, e.g. `TZ=UTC uv run pytest`.
+```
 
 ### Org-reliant Automated Tests
 

@@ -92,13 +92,19 @@ class CliRuntime(BaseCumulusCI):
         elif sys.platform.startswith("linux"):
             return ["notify-send", "--icon=utilities-terminal", "CumulusCI", message]
 
-    def get_org(self, org_name=None, fail_if_missing=True):
+    def get_org(self, org_name=None, fail_if_missing=True, check_expired=True):
+        """Return (org_name, org_config) for the named org, or the default org.
+
+        With check_expired (the default), an expired scratch org is recreated.
+        Pass check_expired=False to look the org up without touching it, and
+        call check_org_expired() once it is known the org will be used."""
         if org_name:
             org_config = self.keychain.get_org(org_name)
         else:
             org_name, org_config = self.keychain.get_default_org()
         if org_config:
-            org_config = self.check_org_expired(org_name, org_config)
+            if check_expired:
+                org_config = self.check_org_expired(org_name, org_config)
         elif fail_if_missing:
             raise click.UsageError("No org specified and no default org set.")
         return org_name, org_config
