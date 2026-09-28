@@ -153,6 +153,13 @@ class OrgConfig(BaseConfig):
         return sf_oauth.refresh_token(self.refresh_token)
 
     @property
+    def exists(self) -> bool:
+        """True if the org exists and can be connected to as it is.
+
+        Only a scratch org can be missing: see ScratchOrgConfig.exists."""
+        return True
+
+    @property
     def lightning_base_url(self):
         instance_url = self.instance_url.rstrip("/")
         if SANDBOX_MYDOMAIN_RE.search(instance_url):

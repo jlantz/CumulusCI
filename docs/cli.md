@@ -264,10 +264,13 @@ $ cci flow run <name> --org <org> [options]
 
 This command runs the task or flow `<name>` against the org `<org>`.
 
-A flow connects to the org only when it reaches the first step that
-needs one: a task that works with a Salesforce org, or a step whose
-`when` expression uses `org_config`. A flow in which no step needs an
-org runs without one, and never creates or refreshes a scratch org.
+If the org already exists, the flow refreshes its credentials before
+it runs any step. A scratch org that has not been created yet is created
+only when the flow reaches the first step that needs an org: a task that
+works with a Salesforce org, or a step whose `when` expression uses
+`org_config`. An expired scratch org is recreated before the flow starts
+if any step needs an org. A flow in which no step needs an org runs
+without one, and never creates or recreates a scratch org.
 
 ```{tip}
 You can see a list of available orgs by running `cci org list`.
