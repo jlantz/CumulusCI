@@ -26,11 +26,13 @@ Upon initialization, FlowRunner:
 
 Upon running the flow, FlowRunner:
 
+- Refreshes the org credentials, if the org already exists
 - Runs each StepSpec in order
 - * Logs the task or skip
-- * Refreshes the org credentials, once, right before the first step that
-    needs an org (a Salesforce task, or a `when` expression that references
-    `org_config`). A flow in which no step needs an org never touches it.
+- * Creates a scratch org that has not been created yet, once, right before
+    the first step that needs an org (a Salesforce task, or a `when`
+    expression that references `org_config`). A flow in which no step needs
+    an org never creates it.
 - * Updates any ^^ task option values with return_values references
 - * Creates a TaskRunner to run the task and get the result
 - * Re-raise any fatal exceptions from the task, if not ignore_failure.
@@ -509,10 +511,15 @@ class FlowCoordinator:
     def run(self, org_config: Optional[OrgConfig]):
         """Run the flow.
 
-        The org's credentials are verified and refreshed lazily, right before
-        the first step that needs the org. A flow in which no step needs an
-        org never refreshes (or, for a scratch org, creates) it, and
-        `org_config` may be None."""
+        An org that already exists is verified and refreshed up front, before
+        the `pre_flow` callback, whether or not any step needs it.
+
+        A scratch org that does not exist yet (see `OrgConfig.exists`) is left
+        alone until the first step that needs an org, whose refresh creates
+        it. (An expired scratch org is not recreated here: callers that need
+        it recreate it first, as `cci flow run` does.) A flow in which no step
+        needs an org never creates it, so `pre_flow` and `post_flow` see it
+        uncreated. With no step needing an org, `org_config` may be None."""
         self.org_config = org_config
         self._org_initialized = False
         line = f"Initializing flow: {self.__class__.__name__}"
@@ -523,7 +530,11 @@ class FlowCoordinator:
         self.logger.info(self.flow_config.description)
         self._rule(new_line=True)
 
-        # Give pre_flow callback a chance to alter the steps before we display them.
+        if org_config is not None and org_config.exists:
+            self._ensure_org()
+
+        # Give pre_flow callback a chance to alter the steps
+        # based on the state of the org before we display the steps.
         self.callbacks.pre_flow(self)
 
         self._rule(fill="-")
@@ -789,7 +800,8 @@ class FlowCoordinator:
                 flow_stack.pop()
 
     def _ensure_org(self, step: Optional[StepSpec] = None):
-        """Verify and refresh the org the first time a step needs it."""
+        """Verify and refresh the org, creating it if it is a scratch org
+        that does not exist yet, unless that was already done in this run."""
         if self._org_initialized:
             return
         if self.org_config is None:

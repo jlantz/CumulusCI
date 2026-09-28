@@ -319,7 +319,9 @@ def _run_flow(runtime, flow_name, org=None, delete_org=False):
 
 
 def _expired_scratch_org():
-    org_config = mock.Mock(scratch=True, date_created=True, expired=True, config={})
+    org_config = mock.Mock(
+        scratch=True, date_created=True, expired=True, exists=False, config={}
+    )
     org_config.name = "dev"
     return org_config
 
@@ -343,7 +345,7 @@ def test_flow_run__org_free_flow_never_touches_named_org(run_task):
     _run_flow(runtime, "org_free", org="dev")
 
     run_task.assert_called_once()
-    # Neither recreated (expired) nor refreshed (created on first use).
+    # Neither recreated nor refreshed: it does not exist, and nothing needs it.
     runtime.keychain.create_scratch_org.assert_not_called()
     org_config.create_org.assert_not_called()
     org_config.refresh_oauth_token.assert_not_called()
@@ -360,13 +362,41 @@ def test_flow_run__org_free_flow_never_touches_default_org(run_task):
     org_config.refresh_oauth_token.assert_not_called()
 
 
+@mock.patch("cumulusci.cli.tests.test_flow.DummyTask._run_task")
+def test_flow_run__org_free_flow_refreshes_existing_default_org(run_task):
+    org_config = mock.Mock(scratch=False, exists=True, config={})
+    org_config.save_if_changed.return_value.__enter__ = lambda *args: ...
+    org_config.save_if_changed.return_value.__exit__ = lambda *args: ...
+    runtime = _lazy_org_runtime(default_org=("dev", org_config))
+
+    _run_flow(runtime, "org_free")
+
+    run_task.assert_called_once()
+    org_config.refresh_oauth_token.assert_called_once()
+    runtime.keychain.create_scratch_org.assert_not_called()
+
+
 def test_flow_run__org_needing_flow_without_default_org():
     runtime = _lazy_org_runtime()
+    runtime.alert = mock.Mock()
 
     with pytest.raises(
         click.UsageError, match="No org specified and no default org set."
     ):
         _run_flow(runtime, "needs_org")
+
+    # A usage error, raised before the flow starts: no "Flow error" alert.
+    runtime.alert.assert_not_called()
+
+
+def test_flow_run__flow_init_error_alerts():
+    runtime = _lazy_org_runtime()
+    runtime.alert = mock.Mock()
+
+    with pytest.raises(FlowNotFoundError):
+        _run_flow(runtime, "no_such_flow")
+
+    runtime.alert.assert_called_once_with("Flow error: no_such_flow")
 
 
 @mock.patch("cumulusci.cli.tests.test_flow.DummyTask._run_task")
@@ -394,7 +424,7 @@ def test_flow_run__delete_org_without_any_org():
 
 @mock.patch("cumulusci.cli.tests.test_flow.DummyTask._run_task")
 def test_flow_run__delete_org_after_org_free_flow(run_task):
-    org_config = mock.Mock(scratch=True, config={})
+    org_config = mock.Mock(scratch=True, exists=False, config={})
     runtime = _lazy_org_runtime(default_org=("dev", org_config))
 
     _run_flow(runtime, "org_free", delete_org=True)

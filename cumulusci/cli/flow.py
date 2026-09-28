@@ -1,5 +1,6 @@
 import json
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -145,8 +146,9 @@ def flow_info(runtime, flow_name):
 def flow_run(runtime, flow_name, org, delete_org, debug, o, no_prompt):
 
     # Look the org up without failing or recreating it yet: a flow in which no
-    # step needs an org runs without one, and never creates or refreshes it.
-    # Whether this flow needs an org is decided below, once its steps are known.
+    # step needs an org runs without one, and never creates or recreates a
+    # scratch org. Whether this flow needs an org is decided below, once its
+    # steps are known.
     _, org_config = runtime.get_org(org, fail_if_missing=False, check_expired=False)
     if delete_org:
         if org_config is None:
@@ -168,20 +170,27 @@ def flow_run(runtime, flow_name, org, delete_org, debug, o, no_prompt):
                     "-o option for flows should contain __ to split task name from option name."
                 )
 
+    @contextmanager
+    def alert_on_error():
+        try:
+            yield
+        except Exception:
+            runtime.alert(f"Flow error: {flow_name}")
+            raise
+
     # Create the flow and handle initialization exceptions
     try:
-        coordinator = runtime.get_flow(flow_name, options=options)
+        with alert_on_error():
+            coordinator = runtime.get_flow(flow_name, options=options)
         if coordinator.requires_org:
-            # Resolve the org for real: fail if there is none, as before, and
-            # recreate it if it is an expired scratch org.
+            # Resolve the org for real, outside the alert as before: fail if
+            # there is none, and recreate it if it is an expired scratch org.
             _, org_config = runtime.get_org(org)
-        start_time = datetime.now()
-        coordinator.run(org_config)
-        duration = datetime.now() - start_time
-        click.echo(f"Ran {flow_name} in {format_duration(duration)}")
-    except Exception:
-        runtime.alert(f"Flow error: {flow_name}")
-        raise
+        with alert_on_error():
+            start_time = datetime.now()
+            coordinator.run(org_config)
+            duration = datetime.now() - start_time
+            click.echo(f"Ran {flow_name} in {format_duration(duration)}")
     finally:
         # Delete the scratch org if --delete-org was set
         if delete_org:

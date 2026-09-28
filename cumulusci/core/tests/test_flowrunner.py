@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -10,6 +11,7 @@ from cumulusci.cli import cci
 from cumulusci.cli.tests.test_cci import MagicMock
 from cumulusci.core.config import FlowConfig, OrgConfig
 from cumulusci.core.config.project_config import BaseProjectConfig
+from cumulusci.core.config.scratch_org_config import ScratchOrgConfig
 from cumulusci.core.exceptions import (
     CumulusCIUsageError,
     FlowConfigError,
@@ -18,6 +20,7 @@ from cumulusci.core.exceptions import (
     TaskNotFoundError,
 )
 from cumulusci.core.flowrunner import (
+    FlowCallback,
     FlowCoordinator,
     PreflightFlowCoordinator,
     StepSpec,
@@ -633,11 +636,30 @@ class _TaskRecordsOrgConfig(BaseTask):
 
 
 class TestLazyOrgInit(AbstractFlowCoordinatorTest):
-    """The org is initialized only right before the first step that needs it."""
+    """An org that exists is refreshed up front; a scratch org that does not
+    exist yet is only created right before the first step that needs it."""
 
     def _setup_project_config(self):
         _SfdcTaskRecordsOrgInit.org_initialized_at_run = []
         _TaskRecordsOrgConfig.received = []
+        self.events = []
+        # A scratch org that has not been created yet. Its first credential
+        # refresh is what creates it (SfdxOrgConfig.sfdx_info).
+        self.new_scratch_org = ScratchOrgConfig(
+            {"username": "sample@example", "org_id": ORG_ID, "created": False},
+            "dev",
+            mock.Mock(),
+        )
+
+        def create(keychain):
+            self.events.append("created")
+            self.new_scratch_org.config["created"] = True
+
+        self.new_scratch_org.refresh_oauth_token = mock.Mock(side_effect=create)
+        self.new_scratch_org.save = mock.Mock()
+        self.org_config.refresh_oauth_token.side_effect = (
+            lambda keychain: self.events.append("refreshed")
+        )
         self.project_config.config["tasks"] = {
             "org_free": {
                 "description": "Needs no org",
@@ -676,75 +698,133 @@ class TestLazyOrgInit(AbstractFlowCoordinatorTest):
             flow_config = FlowConfig({"steps": steps})
         return FlowCoordinator(self.project_config, flow_config, **kwargs)
 
-    def test_org_free_flow__never_initializes_org(self):
+    def _recording_callbacks(self):
+        events = self.events
+
+        class Callbacks(FlowCallback):
+            def pre_flow(self, coordinator):
+                events.append(("pre_flow", bool(coordinator.org_config.created)))
+
+            def post_flow(self, coordinator):
+                events.append(("post_flow", bool(coordinator.org_config.created)))
+
+        return Callbacks()
+
+    # An org that already exists: refreshed eagerly, as before.
+
+    def test_existing_org__refreshed_before_pre_flow(self):
+        self.org_config.config["created"] = True
+        flow = self._flow(
+            {1: {"task": "org_free"}, 2: {"task": "sfdc_task"}},
+            callbacks=self._recording_callbacks(),
+        )
+
+        flow.run(self.org_config)
+
+        assert self.events == [
+            "refreshed",
+            ("pre_flow", True),
+            ("post_flow", True),
+        ]
+        self.org_config.refresh_oauth_token.assert_called_once()
+        assert _SfdcTaskRecordsOrgInit.org_initialized_at_run == [True]
+        # The org block is logged before the steps, as before.
+        info = self.flow_log["info"]
+        org_line = next(i for i, s in enumerate(info) if ORG_ID in s)
+        steps_line = info.index("Steps:")
+        assert org_line < steps_line
+
+    def test_existing_org__refreshed_even_for_org_free_flow(self):
         flow = self._flow(name="org_free_flow")
         assert not flow.requires_org
 
         flow.run(self.org_config)
 
-        self.org_config.refresh_oauth_token.assert_not_called()
-        assert not any(ORG_ID in s for s in self.flow_log["info"])
-        # A named org is still passed through to the tasks, just not touched.
+        self.org_config.refresh_oauth_token.assert_called_once()
+        assert 1 == len([s for s in self.flow_log["info"] if ORG_ID in s])
         assert _TaskRecordsOrgConfig.received == [self.org_config, self.org_config]
 
-    def test_org_free_flow__runs_without_an_org(self):
+    def test_existing_scratch_org__refreshed_even_for_org_free_flow(self):
+        self.new_scratch_org.config["created"] = True
+        self.new_scratch_org.config["date_created"] = datetime.utcnow()
+        assert self.new_scratch_org.exists
         flow = self._flow(name="org_free_flow")
-        flow.run(None)
 
-        assert _TaskRecordsOrgConfig.received == [None, None]
-        assert any("Completed flow successfully!" in s for s in self.flow_log["info"])
+        flow.run(self.new_scratch_org)
 
-    def test_nested_flow__init_right_before_first_org_step_and_only_once(self):
-        flow = self._flow(name="outer")
-        assert flow.requires_org
-        self.org_config.refresh_oauth_token.side_effect = lambda keychain: (
-            _TaskRecordsOrgConfig.received.append("refreshed")
-        )
+        self.new_scratch_org.refresh_oauth_token.assert_called_once()
 
-        flow.run(self.org_config)
+    # A scratch org that does not exist yet: created lazily, or never.
 
-        # outer.1 and deep_sfdc_flow.1 run before the refresh; both sfdc steps after.
+    def test_new_scratch_org__org_free_flow_never_creates_it(self):
+        flow = self._flow(name="org_free_flow", callbacks=self._recording_callbacks())
+
+        flow.run(self.new_scratch_org)
+
+        self.new_scratch_org.refresh_oauth_token.assert_not_called()
+        assert not self.new_scratch_org.created
+        assert self.events == [("pre_flow", False), ("post_flow", False)]
+        assert not any(ORG_ID in s for s in self.flow_log["info"])
+        # The org is still passed through to the tasks, just not created.
         assert _TaskRecordsOrgConfig.received == [
-            self.org_config,
-            self.org_config,
-            "refreshed",
+            self.new_scratch_org,
+            self.new_scratch_org,
         ]
-        self.org_config.refresh_oauth_token.assert_called_once()
+
+    def test_expired_scratch_org__org_free_flow_never_recreates_it(self):
+        self.new_scratch_org.config["created"] = True
+        self.new_scratch_org.config["date_created"] = datetime.utcnow() - timedelta(
+            days=30
+        )
+        assert self.new_scratch_org.expired
+        assert not self.new_scratch_org.exists
+
+        self._flow(name="org_free_flow").run(self.new_scratch_org)
+
+        self.new_scratch_org.refresh_oauth_token.assert_not_called()
+
+    def test_new_scratch_org__created_right_before_first_org_step(self):
+        flow = self._flow(name="outer", callbacks=self._recording_callbacks())
+        assert flow.requires_org
+        _TaskRecordsOrgConfig.received = self.events
+
+        flow.run(self.new_scratch_org)
+
+        # outer.1 and deep_sfdc_flow.1 run before the creation; both sfdc
+        # steps after it, and post_flow sees the created org.
+        assert self.events == [
+            ("pre_flow", False),
+            self.new_scratch_org,
+            self.new_scratch_org,
+            "created",
+            ("post_flow", True),
+        ]
+        self.new_scratch_org.refresh_oauth_token.assert_called_once()
         assert _SfdcTaskRecordsOrgInit.org_initialized_at_run == [True, True]
         assert 1 == len([s for s in self.flow_log["info"] if ORG_ID in s])
 
-    def test_org_free_step_fails_first__no_org_init(self):
+    def test_new_scratch_org__not_created_if_earlier_org_free_step_fails(self):
         flow = self._flow({1: {"task": "org_free_fails"}, 2: {"task": "sfdc_task"}})
         assert flow.requires_org
 
         with pytest.raises(Exception, match="org-free failure"):
-            flow.run(self.org_config)
+            flow.run(self.new_scratch_org)
 
-        self.org_config.refresh_oauth_token.assert_not_called()
+        self.new_scratch_org.refresh_oauth_token.assert_not_called()
+        assert not self.new_scratch_org.created
 
-    def test_org_step_without_org__raises_usage_error(self):
-        flow = self._flow({1: {"task": "org_free"}, 2: {"task": "sfdc_task"}})
-
-        with pytest.raises(CumulusCIUsageError, match="sfdc_task requires an org"):
-            flow.run(None)
-
-        assert _TaskRecordsOrgConfig.received == [None]
-
-    def test_when_referencing_org_config__inits_before_evaluating(self):
-        seen = []
-        self.org_config.refresh_oauth_token.side_effect = lambda keychain: seen.append(
-            "refreshed"
-        )
-        flow = self._flow({1: {"task": "org_free", "when": "org_config.scratch"}})
+    def test_new_scratch_org__created_before_when_referencing_org_config(self):
+        flow = self._flow({1: {"task": "org_free", "when": "org_config.created"}})
         assert flow.requires_org
 
-        flow.run(self.org_config)
+        flow.run(self.new_scratch_org)
 
-        assert seen == ["refreshed"]
-        # org_config.scratch is falsy for this org, so the task was skipped.
-        assert _TaskRecordsOrgConfig.received == []
+        # The when saw the created org, so the task ran.
 
-    def test_when_not_referencing_org_config__does_not_init(self):
+        assert self.events == ["created"]
+        assert _TaskRecordsOrgConfig.received == [self.new_scratch_org]
+
+    def test_when_not_referencing_org_config__does_not_create(self):
         flow = self._flow(
             {
                 1: {"task": "org_free", "when": "project_config.repo_name"},
@@ -756,11 +836,34 @@ class TestLazyOrgInit(AbstractFlowCoordinatorTest):
         assert flow.steps[1].requires_org
         assert not flow.steps[1].when_requires_org
 
-        flow.run(self.org_config)
+        flow.run(self.new_scratch_org)
 
-        # step 2's when is False, so the Salesforce task never ran: no init.
-        self.org_config.refresh_oauth_token.assert_not_called()
-        assert _TaskRecordsOrgConfig.received == [self.org_config]
+        # step 2's when is False, so the Salesforce task never ran: no creation.
+        self.new_scratch_org.refresh_oauth_token.assert_not_called()
+        assert _TaskRecordsOrgConfig.received == [self.new_scratch_org]
+
+    def test_run_twice__initializes_each_run(self):
+        flow = self._flow({1: {"task": "sfdc_task"}})
+        flow.run(self.new_scratch_org)  # created lazily
+        flow.run(self.new_scratch_org)  # now exists: refreshed eagerly
+        assert self.new_scratch_org.refresh_oauth_token.call_count == 2
+
+    # No org at all.
+
+    def test_org_free_flow__runs_without_an_org(self):
+        flow = self._flow(name="org_free_flow")
+        flow.run(None)
+
+        assert _TaskRecordsOrgConfig.received == [None, None]
+        assert any("Completed flow successfully!" in s for s in self.flow_log["info"])
+
+    def test_org_step_without_org__raises_usage_error(self):
+        flow = self._flow({1: {"task": "org_free"}, 2: {"task": "sfdc_task"}})
+
+        with pytest.raises(CumulusCIUsageError, match="sfdc_task requires an org"):
+            flow.run(None)
+
+        assert _TaskRecordsOrgConfig.received == [None]
 
     def test_unparseable_when__is_conservative(self):
         flow = self._flow({1: {"task": "org_free", "when": "project_config and"}})
@@ -786,11 +889,17 @@ class TestLazyOrgInit(AbstractFlowCoordinatorTest):
         flow = self._flow({1: {"task": "org_free"}, 2: {"flow": "None"}})
         assert not flow.requires_org
 
-    def test_run_twice__reinitializes(self):
-        flow = self._flow({1: {"task": "sfdc_task"}})
-        flow.run(self.org_config)
-        flow.run(self.org_config)
-        assert self.org_config.refresh_oauth_token.call_count == 2
+
+def test_org_exists():
+    assert OrgConfig({}, "persistent").exists
+    scratch = ScratchOrgConfig({"created": False}, "dev")
+    assert not scratch.exists
+    scratch.config["created"] = True
+    assert scratch.exists  # an imported org may carry no date_created
+    scratch.config["date_created"] = datetime.utcnow()
+    assert scratch.exists
+    scratch.config["date_created"] = datetime.utcnow() - timedelta(days=2)
+    assert not scratch.exists  # expired: days defaults to 1
 
 
 @pytest.mark.parametrize(

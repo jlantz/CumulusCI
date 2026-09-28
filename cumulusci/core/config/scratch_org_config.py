@@ -45,6 +45,15 @@ class ScratchOrgConfig(SfdxOrgConfig):
         return self.date_created and not self.expired
 
     @property
+    def exists(self) -> bool:
+        """True if the scratch org has been created and has not expired.
+
+        False means it must be created (the first time its credentials are
+        refreshed, see SfdxOrgConfig.sfdx_info) or, once expired, recreated
+        (see CliRuntime.check_org_expired) before it can be used."""
+        return bool(self.created) and not self.expired
+
+    @property
     def expired(self) -> bool:
         """Check if an org has already expired"""
         return bool(self.expires) and self.expires < datetime.datetime.utcnow()
