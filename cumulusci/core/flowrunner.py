@@ -26,9 +26,11 @@ Upon initialization, FlowRunner:
 
 Upon running the flow, FlowRunner:
 
-- Refreshes the org credentials
 - Runs each StepSpec in order
 - * Logs the task or skip
+- * Refreshes the org credentials, once, right before the first step that
+    needs an org (a Salesforce task, or a `when` expression that references
+    `org_config`). A flow in which no step needs an org never touches it.
 - * Updates any ^^ task option values with return_values references
 - * Creates a TaskRunner to run the task and get the result
 - * Re-raise any fatal exceptions from the task, if not ignore_failure.
@@ -68,12 +70,15 @@ from typing import (
     Union,
 )
 
+from jinja2 import TemplateSyntaxError, meta, nodes
+from jinja2.parser import Parser
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from cumulusci.core.config import FlowConfig, TaskConfig
 from cumulusci.core.config.org_config import OrgConfig
 from cumulusci.core.config.project_config import BaseProjectConfig
 from cumulusci.core.exceptions import (
+    CumulusCIUsageError,
     FlowConfigError,
     FlowInfiniteLoopError,
     TaskImportError,
@@ -87,6 +92,27 @@ if TYPE_CHECKING:
 RETURN_VALUE_OPTION_PREFIX = "^^"
 
 jinja2_env = ImmutableSandboxedEnvironment()
+
+ORG_CONFIG_VARIABLE = "org_config"
+
+
+def expression_references(expression: str, name: str) -> bool:
+    """Return True if the jinja2 expression refers to the variable `name`.
+
+    The expression is parsed the same way `compile_expression` parses it, so
+    this only matches a real reference to the variable, not the name appearing
+    inside a string literal or as an attribute of another object. An expression
+    that cannot be parsed is assumed to reference the variable."""
+    try:
+        parser = Parser(jinja2_env, expression, state="variable")
+        expr = parser.parse_expression()
+        if not parser.stream.eos:
+            return True
+    except TemplateSyntaxError:
+        return True
+    template = nodes.Template([nodes.Output([expr], lineno=1)], lineno=1)
+    template.set_environment(jinja2_env)
+    return name in meta.find_undeclared_variables(template)
 
 
 class StepVersion(LooseVersion):
@@ -154,6 +180,21 @@ class StepSpec:
             self.path = ".".join([from_flow, task_name])
         else:
             self.path = task_name
+
+    @property
+    def when_requires_org(self) -> bool:
+        """True if evaluating this step's `when` expression needs the org."""
+        return bool(self.when) and expression_references(self.when, ORG_CONFIG_VARIABLE)
+
+    @property
+    def requires_org(self) -> bool:
+        """True if running this step needs an org: it runs a Salesforce task,
+        or its `when` expression references `org_config`."""
+        if self.skip or self.task_class is None:
+            return False
+        return self.when_requires_org or bool(
+            getattr(self.task_class, "salesforce_task", False)
+        )
 
     def __repr__(self):
         skipstr = ""
@@ -344,6 +385,7 @@ class FlowCoordinator:
         self.flow_config = flow_config
         self.name = name
         self.org_config = None
+        self._org_initialized = False
 
         if not callbacks:
             callbacks = FlowCallback()
@@ -459,8 +501,20 @@ class FlowCoordinator:
 
         return lines
 
-    def run(self, org_config: OrgConfig):
+    @property
+    def requires_org(self) -> bool:
+        """True if any step in this flow needs an org to run."""
+        return any(step.requires_org for step in self.steps)
+
+    def run(self, org_config: Optional[OrgConfig]):
+        """Run the flow.
+
+        The org's credentials are verified and refreshed lazily, right before
+        the first step that needs the org. A flow in which no step needs an
+        org never refreshes (or, for a scratch org, creates) it, and
+        `org_config` may be None."""
         self.org_config = org_config
+        self._org_initialized = False
         line = f"Initializing flow: {self.__class__.__name__}"
         if self.name:
             line = f"{line} ({self.name})"
@@ -469,16 +523,7 @@ class FlowCoordinator:
         self.logger.info(self.flow_config.description)
         self._rule(new_line=True)
 
-        self._init_org()
-        self._rule(fill="-")
-        self.logger.info("Organization:")
-        self.logger.info(f"  Username: {org_config.username}")
-        self.logger.info(f"    Org Id: {org_config.org_id}")
-        self.logger.info(f"  Instance: {org_config.instance_name}")
-        self._rule(fill="-", new_line=True)
-
-        # Give pre_flow callback a chance to alter the steps
-        # based on the state of the org before we display the steps.
+        # Give pre_flow callback a chance to alter the steps before we display them.
         self.callbacks.pre_flow(self)
 
         self._rule(fill="-")
@@ -494,9 +539,8 @@ class FlowCoordinator:
             for step in self.steps:
                 self._run_step(step)
             flow_name = f"'{self.name}' " if self.name else ""
-            self.logger.info(
-                f"Completed flow {flow_name}on org {org_config.name} successfully!"
-            )
+            on_org = f"on org {org_config.name} " if org_config else ""
+            self.logger.info(f"Completed flow {flow_name}{on_org}successfully!")
         finally:
             self.callbacks.post_flow(self)
 
@@ -508,17 +552,23 @@ class FlowCoordinator:
             return
 
         if step.when:
+            # Compile first so a malformed expression reports its syntax error.
+            expr = jinja2_env.compile_expression(step.when)
+            if step.when_requires_org:
+                self._ensure_org(step)
             jinja2_context = {
                 "project_config": step.project_config,
                 "org_config": self.org_config,
             }
-            expr = jinja2_env.compile_expression(step.when)
             value = expr(**jinja2_context)
             if not value:
                 self.logger.info(
                     f"Skipping task {step.task_name} (skipped unless {step.when})"
                 )
                 return
+
+        if step.requires_org:
+            self._ensure_org(step)
 
         self._rule(fill="-")
         self.logger.info(f"Running task: {step.task_name}")
@@ -738,6 +788,29 @@ class FlowCoordinator:
                 self._check_infinite_flows(next_flow_config, flow_stack)
                 flow_stack.pop()
 
+    def _ensure_org(self, step: Optional[StepSpec] = None):
+        """Verify and refresh the org the first time a step needs it."""
+        if self._org_initialized:
+            return
+        if self.org_config is None:
+            needed_by = f"Task {step.task_name}" if step else "This flow"
+            raise CumulusCIUsageError(
+                f"{needed_by} requires an org, but no org was specified."
+            )
+        self._init_org()
+        self._log_org()
+        self._org_initialized = True
+
+    def _log_org(self, instance: bool = True):
+        assert self.org_config is not None
+        self._rule(fill="-")
+        self.logger.info("Organization:")
+        self.logger.info(f"  Username: {self.org_config.username}")
+        self.logger.info(f"    Org Id: {self.org_config.org_id}")
+        if instance:
+            self.logger.info(f"  Instance: {self.org_config.instance_name}")
+        self._rule(fill="-", new_line=True)
+
     def _init_org(self):
         """Test and refresh credentials to the org specified."""
         self.logger.info(
@@ -769,16 +842,22 @@ class PreflightFlowCoordinator(FlowCoordinator):
     preflight_results: DefaultDict[Optional[str], List[dict]]
     _task_caches: Dict[BaseProjectConfig, "TaskCache"]
 
+    @property
+    def requires_org(self) -> bool:
+        """Preflight checks exist to inspect the target org, so they always need it."""
+        return True
+
     def run(self, org_config: OrgConfig):
+        # Preflight checks inspect the target org (their `when` expressions
+        # read org_config and run org-querying tasks), so the org is
+        # initialized eagerly, before any check is evaluated.
         self.org_config = org_config
+        self._org_initialized = False
         self.callbacks.pre_flow(self)
 
         self._init_org()
-        self._rule(fill="-")
-        self.logger.info("Organization:")
-        self.logger.info(f"  Username: {org_config.username}")
-        self.logger.info(f"    Org Id: {org_config.org_id}")
-        self._rule(fill="-", new_line=True)
+        self._log_org(instance=False)
+        self._org_initialized = True
 
         self.logger.info("Running preflight checks...")
         self._rule(new_line=True)

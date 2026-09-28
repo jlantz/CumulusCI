@@ -274,3 +274,130 @@ def test_flow_run__org_delete_error(echo):
     echo.assert_any_call(
         "Scratch org deletion failed.  Ignoring the error below to complete the flow:"
     )
+
+
+def _lazy_org_runtime(default_org=(None, None)):
+    runtime = CliRuntime(
+        config={
+            "flows": {
+                "org_free": {"steps": {1: {"task": "org_free_task"}}},
+                "needs_org": {
+                    "steps": {1: {"task": "org_free_task"}, 2: {"task": "sfdc_task"}}
+                },
+            },
+            "tasks": {
+                "org_free_task": {
+                    "class_path": "cumulusci.cli.tests.test_flow.DummyTask",
+                    "description": "Needs no org",
+                    "options": {"color": "blue"},
+                },
+                "sfdc_task": {
+                    "class_path": "cumulusci.core.tests.test_flowrunner._SfdcTask",
+                    "description": "Needs an org",
+                },
+            },
+        },
+        load_keychain=False,
+    )
+    runtime.keychain = mock.Mock()
+    runtime.keychain.get_default_org.return_value = default_org
+    runtime.project_config.keychain = runtime.keychain
+    return runtime
+
+
+def _run_flow(runtime, flow_name, org=None, delete_org=False):
+    run_click_command(
+        flow.flow_run,
+        runtime=runtime,
+        flow_name=flow_name,
+        org=org,
+        delete_org=delete_org,
+        debug=False,
+        o=None,
+        no_prompt=True,
+    )
+
+
+def _expired_scratch_org():
+    org_config = mock.Mock(scratch=True, date_created=True, expired=True, config={})
+    org_config.name = "dev"
+    return org_config
+
+
+@mock.patch("cumulusci.cli.tests.test_flow.DummyTask._run_task")
+def test_flow_run__org_free_flow_without_default_org(run_task):
+    runtime = _lazy_org_runtime()
+
+    _run_flow(runtime, "org_free")
+
+    run_task.assert_called_once()
+    runtime.keychain.create_scratch_org.assert_not_called()
+
+
+@mock.patch("cumulusci.cli.tests.test_flow.DummyTask._run_task")
+def test_flow_run__org_free_flow_never_touches_named_org(run_task):
+    org_config = _expired_scratch_org()
+    runtime = _lazy_org_runtime()
+    runtime.keychain.get_org.return_value = org_config
+
+    _run_flow(runtime, "org_free", org="dev")
+
+    run_task.assert_called_once()
+    # Neither recreated (expired) nor refreshed (created on first use).
+    runtime.keychain.create_scratch_org.assert_not_called()
+    org_config.create_org.assert_not_called()
+    org_config.refresh_oauth_token.assert_not_called()
+
+
+@mock.patch("cumulusci.cli.tests.test_flow.DummyTask._run_task")
+def test_flow_run__org_free_flow_never_touches_default_org(run_task):
+    org_config = _expired_scratch_org()
+    runtime = _lazy_org_runtime(default_org=("dev", org_config))
+
+    _run_flow(runtime, "org_free")
+
+    runtime.keychain.create_scratch_org.assert_not_called()
+    org_config.refresh_oauth_token.assert_not_called()
+
+
+def test_flow_run__org_needing_flow_without_default_org():
+    runtime = _lazy_org_runtime()
+
+    with pytest.raises(
+        click.UsageError, match="No org specified and no default org set."
+    ):
+        _run_flow(runtime, "needs_org")
+
+
+@mock.patch("cumulusci.cli.tests.test_flow.DummyTask._run_task")
+def test_flow_run__org_needing_flow_recreates_expired_org(run_task):
+    expired = _expired_scratch_org()
+    recreated = mock.Mock(scratch=True, config={})
+    recreated.save_if_changed.return_value.__enter__ = lambda *args: ...
+    recreated.save_if_changed.return_value.__exit__ = lambda *args: ...
+    runtime = _lazy_org_runtime()
+    runtime.keychain.get_org.side_effect = [expired, expired, recreated]
+
+    _run_flow(runtime, "needs_org", org="dev")
+
+    runtime.keychain.create_scratch_org.assert_called_once()
+    recreated.create_org.assert_called_once()
+    recreated.refresh_oauth_token.assert_called_once()
+
+
+def test_flow_run__delete_org_without_any_org():
+    runtime = _lazy_org_runtime()
+
+    with pytest.raises(click.UsageError, match="--delete-org requires a scratch org"):
+        _run_flow(runtime, "org_free", delete_org=True)
+
+
+@mock.patch("cumulusci.cli.tests.test_flow.DummyTask._run_task")
+def test_flow_run__delete_org_after_org_free_flow(run_task):
+    org_config = mock.Mock(scratch=True, config={})
+    runtime = _lazy_org_runtime(default_org=("dev", org_config))
+
+    _run_flow(runtime, "org_free", delete_org=True)
+
+    org_config.refresh_oauth_token.assert_not_called()
+    org_config.delete_org.assert_called_once()

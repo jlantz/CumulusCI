@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from jinja2 import TemplateSyntaxError
 
 import cumulusci
 from cumulusci.cli import cci
@@ -10,6 +11,7 @@ from cumulusci.cli.tests.test_cci import MagicMock
 from cumulusci.core.config import FlowConfig, OrgConfig
 from cumulusci.core.config.project_config import BaseProjectConfig
 from cumulusci.core.exceptions import (
+    CumulusCIUsageError,
     FlowConfigError,
     FlowInfiniteLoopError,
     TaskImportError,
@@ -20,6 +22,7 @@ from cumulusci.core.flowrunner import (
     PreflightFlowCoordinator,
     StepSpec,
     TaskRunner,
+    expression_references,
 )
 from cumulusci.core.source.local_folder import LocalFolderSource
 from cumulusci.core.tasks import BaseTask
@@ -610,6 +613,205 @@ class TestSimpleTestFlowCoordinator(AbstractFlowCoordinatorTest):
         save.assert_called_once()
 
 
+class _SfdcTaskRecordsOrgInit(BaseTask):
+    """A Salesforce task that records whether the flow had initialized the org."""
+
+    salesforce_task = True
+    org_initialized_at_run: list = []
+
+    def _run_task(self):
+        self.org_initialized_at_run.append(self.org_config.refresh_oauth_token.called)
+
+
+class _TaskRecordsOrgConfig(BaseTask):
+    """An org-free task that records the org_config it received."""
+
+    received: list = []
+
+    def _run_task(self):
+        self.received.append(self.org_config)
+
+
+class TestLazyOrgInit(AbstractFlowCoordinatorTest):
+    """The org is initialized only right before the first step that needs it."""
+
+    def _setup_project_config(self):
+        _SfdcTaskRecordsOrgInit.org_initialized_at_run = []
+        _TaskRecordsOrgConfig.received = []
+        self.project_config.config["tasks"] = {
+            "org_free": {
+                "description": "Needs no org",
+                "class_path": "cumulusci.core.tests.test_flowrunner._TaskRecordsOrgConfig",
+            },
+            "org_free_fails": {
+                "description": "Needs no org, and fails",
+                "class_path": "cumulusci.core.tests.test_flowrunner._TaskRaisesException",
+                "options": {"exception": Exception, "message": "org-free failure"},
+            },
+            "sfdc_task": {
+                "description": "Needs an org",
+                "class_path": "cumulusci.core.tests.test_flowrunner._SfdcTaskRecordsOrgInit",
+            },
+        }
+        self.project_config.config["flows"] = {
+            "org_free_flow": {
+                "steps": {1: {"task": "org_free"}, 2: {"task": "org_free"}},
+            },
+            "deep_sfdc_flow": {
+                "steps": {1: {"task": "org_free"}, 2: {"task": "sfdc_task"}},
+            },
+            "outer": {
+                "steps": {
+                    1: {"task": "org_free"},
+                    2: {"flow": "deep_sfdc_flow"},
+                    3: {"task": "sfdc_task"},
+                },
+            },
+        }
+
+    def _flow(self, steps=None, name=None, **kwargs):
+        if name:
+            flow_config = self.project_config.get_flow(name)
+        else:
+            flow_config = FlowConfig({"steps": steps})
+        return FlowCoordinator(self.project_config, flow_config, **kwargs)
+
+    def test_org_free_flow__never_initializes_org(self):
+        flow = self._flow(name="org_free_flow")
+        assert not flow.requires_org
+
+        flow.run(self.org_config)
+
+        self.org_config.refresh_oauth_token.assert_not_called()
+        assert not any(ORG_ID in s for s in self.flow_log["info"])
+        # A named org is still passed through to the tasks, just not touched.
+        assert _TaskRecordsOrgConfig.received == [self.org_config, self.org_config]
+
+    def test_org_free_flow__runs_without_an_org(self):
+        flow = self._flow(name="org_free_flow")
+        flow.run(None)
+
+        assert _TaskRecordsOrgConfig.received == [None, None]
+        assert any("Completed flow successfully!" in s for s in self.flow_log["info"])
+
+    def test_nested_flow__init_right_before_first_org_step_and_only_once(self):
+        flow = self._flow(name="outer")
+        assert flow.requires_org
+        self.org_config.refresh_oauth_token.side_effect = lambda keychain: (
+            _TaskRecordsOrgConfig.received.append("refreshed")
+        )
+
+        flow.run(self.org_config)
+
+        # outer.1 and deep_sfdc_flow.1 run before the refresh; both sfdc steps after.
+        assert _TaskRecordsOrgConfig.received == [
+            self.org_config,
+            self.org_config,
+            "refreshed",
+        ]
+        self.org_config.refresh_oauth_token.assert_called_once()
+        assert _SfdcTaskRecordsOrgInit.org_initialized_at_run == [True, True]
+        assert 1 == len([s for s in self.flow_log["info"] if ORG_ID in s])
+
+    def test_org_free_step_fails_first__no_org_init(self):
+        flow = self._flow({1: {"task": "org_free_fails"}, 2: {"task": "sfdc_task"}})
+        assert flow.requires_org
+
+        with pytest.raises(Exception, match="org-free failure"):
+            flow.run(self.org_config)
+
+        self.org_config.refresh_oauth_token.assert_not_called()
+
+    def test_org_step_without_org__raises_usage_error(self):
+        flow = self._flow({1: {"task": "org_free"}, 2: {"task": "sfdc_task"}})
+
+        with pytest.raises(CumulusCIUsageError, match="sfdc_task requires an org"):
+            flow.run(None)
+
+        assert _TaskRecordsOrgConfig.received == [None]
+
+    def test_when_referencing_org_config__inits_before_evaluating(self):
+        seen = []
+        self.org_config.refresh_oauth_token.side_effect = lambda keychain: seen.append(
+            "refreshed"
+        )
+        flow = self._flow({1: {"task": "org_free", "when": "org_config.scratch"}})
+        assert flow.requires_org
+
+        flow.run(self.org_config)
+
+        assert seen == ["refreshed"]
+        # org_config.scratch is falsy for this org, so the task was skipped.
+        assert _TaskRecordsOrgConfig.received == []
+
+    def test_when_not_referencing_org_config__does_not_init(self):
+        flow = self._flow(
+            {
+                1: {"task": "org_free", "when": "project_config.repo_name"},
+                2: {"task": "sfdc_task", "when": "'org_config' == 'x'"},
+            }
+        )
+        # step 2 is still a Salesforce task, so the flow as a whole needs an org
+        assert not flow.steps[0].requires_org
+        assert flow.steps[1].requires_org
+        assert not flow.steps[1].when_requires_org
+
+        flow.run(self.org_config)
+
+        # step 2's when is False, so the Salesforce task never ran: no init.
+        self.org_config.refresh_oauth_token.assert_not_called()
+        assert _TaskRecordsOrgConfig.received == [self.org_config]
+
+    def test_unparseable_when__is_conservative(self):
+        flow = self._flow({1: {"task": "org_free", "when": "project_config and"}})
+        assert flow.steps[0].when_requires_org
+        assert flow.requires_org
+
+        # The syntax error is reported, not a missing-org error.
+        with pytest.raises(TemplateSyntaxError):
+            flow.run(None)
+
+    def test_skipped_steps_do_not_count(self):
+        flow = self._flow(
+            {1: {"task": "org_free"}, 2: {"task": "None"}, 3: {"task": "sfdc_task"}},
+            skip=["sfdc_task"],
+        )
+        assert not flow.requires_org
+
+        flow.run(None)
+
+        assert _TaskRecordsOrgConfig.received == [None]
+
+    def test_skipped_flow_does_not_count(self):
+        flow = self._flow({1: {"task": "org_free"}, 2: {"flow": "None"}})
+        assert not flow.requires_org
+
+    def test_run_twice__reinitializes(self):
+        flow = self._flow({1: {"task": "sfdc_task"}})
+        flow.run(self.org_config)
+        flow.run(self.org_config)
+        assert self.org_config.refresh_oauth_token.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "expression,expected",
+    [
+        ("org_config.scratch", True),
+        ("not org_config", True),
+        ("project_config.x and org_config.namespace == 'ns'", True),
+        ("tasks.check(org=org_config)", True),
+        ("project_config.repo_name", False),
+        ("'org_config' in project_config.repo_name", False),
+        ("project_config.org_config", False),
+        ("True", False),
+        ("project_config and", True),
+        ("x }} {{ y", True),
+    ],
+)
+def test_expression_references_org_config(expression, expected):
+    assert expression_references(expression, "org_config") is expected
+
+
 class TestStepSpec:
     def test_repr(self):
         spec = StepSpec(1, "test_task", {}, None, None, skip=True)
@@ -653,6 +855,20 @@ class TestPreflightFlowCoordinatorTest(AbstractFlowCoordinatorTest):
         # Make sure task result got cached
         key = ("log", (("level", "info"), ("line", "plan")))
         assert key in flow._task_caches[flow.project_config].results
+
+    def test_run__initializes_org_eagerly(self):
+        """Preflight checks inspect the org, so it is initialized even when no
+        step is a Salesforce task."""
+        flow_config = FlowConfig(
+            {"steps": {1: {"task": "log", "options": {"line": "step"}}}}
+        )
+        flow = PreflightFlowCoordinator(self.project_config, flow_config)
+        assert flow.requires_org
+
+        flow.run(self.org_config)
+
+        self.org_config.refresh_oauth_token.assert_called_once()
+        assert 1 == len([s for s in self.flow_log["info"] if ORG_ID in s])
 
     def test_run__cross_project_preflights(self):
         other_project_config = mock.MagicMock()
